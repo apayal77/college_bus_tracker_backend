@@ -1,0 +1,156 @@
+const { Server } = require('socket.io');
+const { sendNotificationToRoute } = require('./services/notificationService');
+const admin = require('firebase-admin');
+
+let io;
+const routeStates = new Map(); // Stores { lastLocation: {}, driverSocketId: null, stops: [] }
+const socketToRoute = new Map(); 
+const notifiedStudents = new Set(); // To prevent spam: "tripId_studentId"
+
+// Haversine formula to calculate distance in meters
+const getDistance = (lat1, lon1, lat2, lon2) => {
+  const R = 6371e3; // metres
+  const φ1 = (lat1 * Math.PI) / 180;
+  const φ2 = (lat2 * Math.PI) / 180;
+  const Δφ = ((lat2 - lat1) * Math.PI) / 180;
+  const Δλ = ((lon2 - lon1) * Math.PI) / 180;
+
+  const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+            Math.cos(φ1) * Math.cos(φ2) *
+            Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return R * c;
+};
+
+const initSocket = (server) => {
+  io = new Server(server, {
+    cors: {
+      origin: "*",
+    },
+    pingInterval: 10000,
+    pingTimeout: 5000,
+  });
+
+  io.on('connection', (socket) => {
+    socket.on('joinRoute', (routeId) => {
+      socket.join(routeId);
+      if (routeStates.has(routeId)) {
+        const state = routeStates.get(routeId);
+        if (state.lastLocation) socket.emit('routeLocationUpdate', state.lastLocation);
+      }
+    });
+
+    socket.on('registerDriver', async (routeId) => {
+      socket.join(routeId);
+      socketToRoute.set(socket.id, routeId);
+
+      // Fetch route stops from Firestore
+      const routeDoc = await admin.firestore().collection('routes').doc(routeId).get();
+      const stops = routeDoc.exists ? routeDoc.data().stops || [] : [];
+
+      if (!routeStates.has(routeId)) {
+        routeStates.set(routeId, { lastLocation: null, driverSocketId: socket.id, stops });
+      } else {
+        const state = routeStates.get(routeId);
+        state.driverSocketId = socket.id;
+        state.stops = stops;
+      }
+      
+      const status = { routeId, online: true };
+      io.to(routeId).emit('driverStatus', status);
+      io.to('admin').emit('driverStatus', status);
+    });
+
+    socket.on('locationUpdate', async (data) => {
+      const { routeId, latitude, longitude, speed } = data;
+      const update = { latitude, longitude, speed, timestamp: Date.now(), routeId };
+
+      if (routeStates.has(routeId)) {
+        const state = routeStates.get(routeId);
+        state.lastLocation = update;
+
+        // Proximity check for "Bus Near Stop" (within 500m)
+        state.stops.forEach(async (stop) => {
+          let stopLat, stopLng, stopName;
+          
+          if (typeof stop === 'string') {
+            stopName = stop;
+            // Try to parse "Name [lat, lng]" format
+            const match = stop.match(/(.+) \[(.+), (.+)\]/);
+            if (match) {
+              stopName = match[1];
+              stopLat = parseFloat(match[2]);
+              stopLng = parseFloat(match[3]);
+            }
+          } else {
+            stopName = stop.name;
+            stopLat = stop.latitude;
+            stopLng = stop.longitude;
+          }
+
+          if (stopLat && stopLng) {
+            const dist = getDistance(latitude, longitude, stopLat, stopLng);
+            if (dist < 500) {
+               const notificationKey = `${routeId}_${stopName}`;
+               if (!notifiedStudents.has(notificationKey)) {
+                  sendNotificationToRoute(
+                    routeId, 
+                    'Bus Nearby! 🚌', 
+                    `The bus is approaching ${stopName}. Be ready!`
+                  );
+                  notifiedStudents.add(notificationKey);
+                  setTimeout(() => notifiedStudents.delete(notificationKey), 30 * 60 * 1000);
+               }
+            }
+          }
+        });
+      }
+
+      // Broadcast to specific route room
+      io.to(routeId).emit('routeLocationUpdate', update);
+      
+      // NEW: Also broadcast to 'admin' room for global monitoring
+      io.to('admin').emit('allBusesUpdate', update);
+    });
+
+    socket.on('tripStatusUpdate', (data) => {
+      const { routeId, status } = data;
+      console.log(`[Socket] Trip ${status} for route: ${routeId}`);
+      
+      // Broadcast to students on this route
+      io.to(routeId).emit('tripStatusChange', { status });
+      
+      // Update admin room
+      io.to('admin').emit('driverStatus', { routeId, online: status === 'started' });
+
+      // Reset notification triggers if a new trip starts
+      if (status === 'started') {
+        for (const key of notifiedStudents.keys()) {
+          if (key.startsWith(`${routeId}_`)) {
+            notifiedStudents.delete(key);
+          }
+        }
+      }
+    });
+
+    socket.on('disconnect', () => {
+      const routeId = socketToRoute.get(socket.id);
+      if (routeId) {
+        const state = routeStates.get(routeId);
+        if (state && state.driverSocketId === socket.id) {
+          state.driverSocketId = null;
+          const status = { routeId, online: false };
+          io.to(routeId).emit('driverStatus', status);
+          io.to('admin').emit('driverStatus', status);
+        }
+      }
+    });
+  });
+
+  return io;
+};
+
+const getIO = () => io;
+
+module.exports = { initSocket, getIO };
